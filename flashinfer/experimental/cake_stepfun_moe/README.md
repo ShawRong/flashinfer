@@ -36,13 +36,13 @@ view of `CakeStepFunConfig.prepare_weights` adds the per-expert fp32
 
 | Path | Content |
 | --- | --- |
-| `build.json` | cake-build/1 manifest: one entry `cake_stepfun_moe_<20hex>_<arch>` per program and architecture, its two sources, digests and closure |
+| `build.json` | cake-build/1 manifest: one entry `cake_stepfun_moe_<20hex>_<arch>` per program and architecture, its kernel source and binding source (a binding shared by several programs is selected by the entry's compile definitions) and their digests, and the content digest (over the entry name, architecture, nvcc flags and the sources' paths and bytes) that names its JIT build |
 | `cake_build.py` | the shared loader: prebuilt `aot/` library when present, else FlashInfer's JIT build of the manifest entry |
-| `cake_jit.py` | the registry rendered by the export: `PROGRAMS` (one record per program with its argument plan, launch shape and stage metadata), `STAGE_TABLES` (the five dispatcher tables), `ROUTES`, `HOST_PLAN_CONSTANTS` |
-| `cake_launch.py` | one positional launcher per program, rendered from its argument plan |
+| `cake_jit.py` | the registry: `PROGRAMS` (one record per program with its argument plan, launch shape -- block, cluster and dynamic shared memory -- and stage metadata, expanded at import from compact per-program rows and the shared argument plans `ARG_PLANS`), `STAGE_TABLES` (the five dispatcher tables), `HOST_PLAN_CONSTANTS`; the export's measurement catalogue (`ROUTES`) lives with the tests as `tests/experimental/test_helpers/cake_stepfun_moe_routes.json` |
+| `cake_launch.py` | `LAUNCH[program]`: the positional launcher of each program, following its argument plan (grid triple last) |
 | `cake_backend.py` | host plan, validation, buffer set, binding and the prepared launches (hand-written) |
-| `csrc/cake_stepfun_moe/` | the generated kernels (`<program>_kernel.cu`) and their TVM-FFI bindings (`<program>_binding.cu`), shared device / host headers |
-| `csrc/cake_device_helpers/` | content-addressed device helper headers the kernels include |
+| `csrc/cake_stepfun_moe/` | the generated kernels (`<program>_kernel.cu`) and their TVM-FFI bindings (`<program>_binding.cu`; a binding whose exported text differs from another's only in the kernel symbol, the host-shim namespace, the block size and the dynamic shared memory is built for that program from the other's file with the compile definitions of its `build.json` entry (`CAKE_PROGRAM_KERNEL`, `CAKE_PROGRAM_SHIM` and, for routing, `CAKE_BINDING_THREADS`, `CAKE_BINDING_SMEM`), so 64 bindings serve the 111 programs), the shared device-common header |
+| `csrc/cake_device_helpers/` | content-addressed device helper headers the kernels include, and `DEEPGEMM_NOTICE.txt` (the MIT notice of the helpers derived from DeepGEMM) |
 | `csrc/cake_ffi_checks.h` | the binding runtime header |
 
 The export writes `build.json`, `cake_build.py`, `cake_jit.py`,
@@ -107,10 +107,17 @@ operations, as keywords).
   `gemm2_output` `[max_padded, hidden_size]` bf16 and `output`
   `[num_tokens, hidden_size]` bf16, allocated once in `prepare_stepfun_moe`
   (`max_padded = max_num_ctas * tile`, the trtllm-gen row capacity).
+* FC1 / FC2 grids follow the unit's `grid_rule`: `tiles`, one CTA (cluster)
+  per output tile, `(grid_m, max_num_ctas, split_k)`; `resident`, one resident
+  CTA (cluster of `c`) per SM (`c` SMs) taking the tiles in turn,
+  `(c * min(SM count // c, grid_m // c * max_num_ctas), 1, 1)`. A resident
+  unit that takes `work_counter` claims tiles from a zeroed `int32[2]` that it
+  leaves zeroed: the backend keeps one per program, stage and stream, zeroed
+  once at allocation (outside stream capture) and never reset per launch.
 * Launch attributes (cluster, cooperative, PDL) are baked into every binding;
   `enable_pdl` is a per-launch argument of the bindings. The cooperative
   routing grid is `SM count - reserved_sms` (`reserved_sms` keyword, default 8;
-  the facade resolves `FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS` per call,
+  the facade resolves `FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS` once per runner,
   where the native C++ reads it once per process).
 * `do_finalize=False` returns `[gemm2_output, expert_weights,
   expanded_idx_to_permuted_idx]` in the native layout; the finalize launch is
@@ -127,7 +134,7 @@ backend to cake-build/1. The JIT modules `fused_moe_cake_stepfun_sm100` /
 `_sm103` and `fused_moe_cake_stepfun_full_*`, `flashinfer/jit/cake_stepfun_moe.py`,
 `csrc/fused_moe/cake_stepfun/**` and `tests/moe/test_cake_stepfun_fused_moe.py`
 are replaced by the package `flashinfer.experimental.cake_stepfun_moe`
-(`build.json` + `cake_build.py` + per-unit TVM-FFI bindings + Python stage
+(`build.json` + `cake_build.py` + TVM-FFI bindings + Python stage
 orchestration in `cake_backend.py`) and
 `tests/experimental/test_cake_stepfun_moe{,_api}.py`. `CakeStepFunConfig` /
 `CakeStepFunRunner` keep their names and import paths in `flashinfer.fused_moe`.
@@ -157,7 +164,7 @@ unchanged except for the four files only StepFun used.
 ## Tests
 
 `tests/experimental/test_cake_stepfun_moe.py` is the backend suite (imports the
-package only through `tests/test_helpers/cake_package.py`);
+package only through `tests/cake/test_helpers/cake_package.py`);
 `tests/experimental/test_cake_stepfun_moe_api.py` tests the
 `flashinfer.fused_moe` route against the native trtllm-gen kernels and writes
 the per-family error table; its `fc1` Cake-vs-native rows are `n/a` (no
